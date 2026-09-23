@@ -1,5 +1,20 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from "vue";
+import {
+  LICENSE_KINDS,
+  STATION_LICENSE_LABEL,
+  kindStatusText,
+  type StationLicenseStatus
+} from "./license/licenseRules";
+import {
+  LICENSE_SCHEMA_VERSION,
+  emptyLicenses,
+  loadMigratedRecords,
+  migrateRecords,
+  saveMigratedRecords,
+  type MigratedRecord
+} from "./license/licenseMigration";
+import { useLicenses } from "./license/licenseCard";
 
 type Field = {
   key: string;
@@ -8,20 +23,14 @@ type Field = {
   options?: readonly string[];
 };
 
-type RecordItem = {
-  id: string;
-  status: string;
-  notes: string;
-  createdAt: string;
-  [key: string]: string | number;
-};
+type RecordItem = MigratedRecord;
 
 const project = {
   "number": 21,
   "folder": "hxwl/frontend/hxwlfront-21",
   "framework": "vue",
   "title": "油站网点地图管理",
-  "subtitle": "维护油站位置、营业状态和库存摘要。",
+  "subtitle": "维护油站位置、营业状态、库存摘要和三类证照到期。",
   "industry": "石油",
   "stack": [
     "Vue3",
@@ -97,31 +106,49 @@ const project = {
 
 const fields = project.fields as readonly Field[];
 const statuses = [...project.statuses];
+const licenseKinds = LICENSE_KINDS;
 
 function createBlank() {
   return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
 }
 
+function seedRecords(): RecordItem[] {
+  const seeded = project.records.map((record, index) => ({
+    ...record,
+    id: `seed-${index + 1}`,
+    createdAt: new Date(Date.now() - index * 86400000).toISOString()
+  }));
+  // 历史种子数据没有证照，统一走迁移：补齐空证照，页面显示「待补录」
+  return migrateRecords(seeded);
+}
+
 function loadRecords(): RecordItem[] {
-  const raw = localStorage.getItem(project.storageKey);
-  if (!raw) {
-    return project.records.map((record, index) => ({
-      ...record,
-      id: `seed-${index + 1}`,
-      createdAt: new Date(Date.now() - index * 86400000).toISOString()
-    })) as RecordItem[];
-  }
-  try {
-    return JSON.parse(raw) as RecordItem[];
-  } catch {
-    return [];
-  }
+  const migrated = loadMigratedRecords(project.storageKey);
+  if (migrated === null) return seedRecords();
+  return migrated;
 }
 
 const records = ref<RecordItem[]>(loadRecords());
 const form = reactive<Record<string, string | number>>(createBlank());
 const note = ref("");
 const filter = ref(project.filters[0]);
+
+function persist() {
+  saveMigratedRecords(project.storageKey, records.value);
+}
+
+const {
+  editingId,
+  draft,
+  viewOf,
+  isBlocked,
+  flowBlockReason,
+  reminders,
+  guardFlow,
+  startEdit,
+  cancelEdit,
+  saveLicenses
+} = useLicenses({ records, persist });
 
 const filteredRecords = computed(() => {
   if (filter.value.startsWith("全部")) return records.value;
@@ -146,10 +173,6 @@ const chartRows = computed(() => statuses.map((status) => ({
 
 const maxChart = computed(() => Math.max(1, ...chartRows.value.map((row) => row.value)));
 
-function persist() {
-  localStorage.setItem(project.storageKey, JSON.stringify(records.value));
-}
-
 function nextStatus(status: string) {
   const index = statuses.indexOf(status);
   return statuses[(index + 1) % statuses.length];
@@ -161,6 +184,18 @@ function primaryText(record: RecordItem) {
   return [record[first.key], record[second.key]].filter(Boolean).join(" / ") || project.entityLabel;
 }
 
+function licenseBadgeClass(status: StationLicenseStatus) {
+  return `lic-badge lic-${status}`;
+}
+
+function kindBadgeClass(status: string) {
+  return `lic-kind kind-${status}`;
+}
+
+function licenseActionText(record: RecordItem) {
+  return viewOf(record).status === "incomplete" ? "补录证照" : "续办证照";
+}
+
 function submit() {
   records.value = [
     {
@@ -168,7 +203,10 @@ function submit() {
       id: crypto.randomUUID(),
       status: statuses[0],
       notes: note.value || "暂无备注",
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      // 新站同样先没有证照，补齐前显示「待补录」且不能流转
+      licenses: emptyLicenses(),
+      licenseSchemaVersion: LICENSE_SCHEMA_VERSION
     } as RecordItem,
     ...records.value
   ];
@@ -178,8 +216,11 @@ function submit() {
 }
 
 function flow(record: RecordItem) {
-  record.status = nextStatus(record.status);
-  persist();
+  // 证照异常 / 待补录期间拦截流转；营业状态本身只在这里被修改，因此始终得以保留
+  guardFlow(record, () => {
+    record.status = nextStatus(record.status);
+    persist();
+  });
 }
 
 function remove(id: string) {
@@ -207,6 +248,26 @@ function remove(id: string) {
           <span>{{ label }}</span>
           <strong>{{ metrics[index] }}</strong>
         </article>
+      </section>
+
+      <section class="license-banner" :class="{ clear: reminders.length === 0 }">
+        <h2>证照续办提醒</h2>
+        <p v-if="reminders.length === 0" class="banner-ok">
+          三类证照齐全有效；到期前 30 天会在此提醒续办。
+        </p>
+        <ul v-else class="banner-list">
+          <li
+            v-for="item in reminders"
+            :key="item.record.id"
+            :class="['banner-item', `tone-${item.tone}`]"
+          >
+            <button type="button" class="banner-link" @click="startEdit(item.record)">
+              <strong>{{ primaryText(item.record) }}</strong>
+              <span>{{ item.message }}</span>
+              <em v-if="item.expiry">到期日：{{ item.expiry }}</em>
+            </button>
+          </li>
+        </ul>
       </section>
 
       <section class="workspace">
@@ -247,9 +308,55 @@ function remove(id: string) {
               <div class="details">
                 <span v-for="field in fields" :key="field.key">{{ field.label }}: {{ record[field.key] }}</span>
               </div>
+
+              <div class="license-block">
+                <div class="license-head">
+                  <span class="license-title">证照状态</span>
+                  <span :class="licenseBadgeClass(viewOf(record).status)">
+                    {{ STATION_LICENSE_LABEL[viewOf(record).status] }}
+                  </span>
+                </div>
+
+                <div v-if="editingId === record.id" class="license-edit">
+                  <label v-for="kind in licenseKinds" :key="kind.key" class="license-field">
+                    {{ kind.label }}到期日
+                    <input v-model="draft[kind.key]" type="date" />
+                  </label>
+                  <p class="license-hint">未填写的证照仍按「待补录」处理，三类都有效后恢复正常。</p>
+                  <div class="license-edit-actions">
+                    <button type="button" @click="saveLicenses(record)">保存证照</button>
+                    <button type="button" class="secondary" @click="cancelEdit">取消</button>
+                  </div>
+                </div>
+
+                <ul v-else class="license-list">
+                  <li v-for="item in viewOf(record).items" :key="item.kind">
+                    <span class="lic-name">{{ item.label }}</span>
+                    <span class="lic-date">{{ item.expiry || "未填写" }}</span>
+                    <span :class="kindBadgeClass(item.status)">{{ kindStatusText(item) }}</span>
+                  </li>
+                </ul>
+              </div>
+
               <p class="note">{{ record.notes }}</p>
+              <p v-if="isBlocked(record)" class="block-tip">{{ flowBlockReason(record) }}</p>
               <div class="actions">
-                <button type="button" @click="flow(record)">流转状态</button>
+                <button
+                  type="button"
+                  :disabled="isBlocked(record)"
+                  :title="flowBlockReason(record) ?? ''"
+                  @click="flow(record)"
+                >
+                  流转状态
+                </button>
+                <button
+                  v-if="editingId !== record.id"
+                  class="secondary"
+                  type="button"
+                  @click="startEdit(record)"
+                >
+                  {{ licenseActionText(record) }}
+                </button>
                 <button class="secondary" type="button" @click="navigator.clipboard?.writeText(primaryText(record))">复制摘要</button>
                 <button class="danger" type="button" @click="remove(record.id)">删除</button>
               </div>
