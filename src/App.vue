@@ -1,5 +1,8 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from "vue";
+import { migrateStations } from "./license/licenseMigration";
+import type { LicenseMap } from "./license/licenseRules";
+import { emptyLicenses, useStationLicenses } from "./license/useStationLicenses";
 
 type Field = {
   key: string;
@@ -13,7 +16,8 @@ type RecordItem = {
   status: string;
   notes: string;
   createdAt: string;
-  [key: string]: string | number;
+  licenses: LicenseMap;
+  [key: string]: unknown;
 };
 
 const project = {
@@ -21,7 +25,7 @@ const project = {
   "folder": "hxwl/frontend/hxwlfront-21",
   "framework": "vue",
   "title": "油站网点地图管理",
-  "subtitle": "维护油站位置、营业状态和库存摘要。",
+  "subtitle": "维护油站位置、营业状态、库存摘要和证照到期日。",
   "industry": "石油",
   "stack": [
     "Vue3",
@@ -102,17 +106,35 @@ function createBlank() {
   return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
 }
 
+/** 生成相对今天偏移 offsetDays 天的 'YYYY-MM-DD'，用于内置样例的证照到期日 */
+function sampleDate(offsetDays: number) {
+  const date = new Date();
+  date.setDate(date.getDate() + offsetDays);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
 function loadRecords(): RecordItem[] {
   const raw = localStorage.getItem(project.storageKey);
   if (!raw) {
+    // 样例：一站证照齐全（含一张临近 30 天到期的消防证照，用于演示提醒）；
+    // 机场快线站不带证照，模拟历史数据，页面显示“待补录”
+    const seedLicenses: LicenseMap[] = [
+      { business: sampleDate(420), chemical: sampleDate(200), fire: sampleDate(18) },
+      {}
+    ];
     return project.records.map((record, index) => ({
       ...record,
       id: `seed-${index + 1}`,
-      createdAt: new Date(Date.now() - index * 86400000).toISOString()
+      createdAt: new Date(Date.now() - index * 86400000).toISOString(),
+      licenses: seedLicenses[index]
     })) as RecordItem[];
   }
   try {
-    return JSON.parse(raw) as RecordItem[];
+    const parsed = JSON.parse(raw) as RecordItem[];
+    // 历史数据迁移：补齐证照字段，已录入的到期日原样保留
+    const { list, changed } = migrateStations(parsed);
+    if (changed) localStorage.setItem(project.storageKey, JSON.stringify(list));
+    return list;
   } catch {
     return [];
   }
@@ -122,6 +144,9 @@ const records = ref<RecordItem[]>(loadRecords());
 const form = reactive<Record<string, string | number>>(createBlank());
 const note = ref("");
 const filter = ref(project.filters[0]);
+
+const lic = useStationLicenses();
+const { saveHint } = lic;
 
 const filteredRecords = computed(() => {
   if (filter.value.startsWith("全部")) return records.value;
@@ -168,7 +193,9 @@ function submit() {
       id: crypto.randomUUID(),
       status: statuses[0],
       notes: note.value || "暂无备注",
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      // 新油站证照待站长补录
+      licenses: emptyLicenses()
     } as RecordItem,
     ...records.value
   ];
@@ -178,8 +205,15 @@ function submit() {
 }
 
 function flow(record: RecordItem) {
+  // 证照异常 / 待补录期间不能流转；营业状态始终保留，不做任何改动
+  if (!lic.canFlow(record)) return;
   record.status = nextStatus(record.status);
   persist();
+}
+
+function saveLicenses(record: RecordItem) {
+  const allValid = lic.saveEdit(record, persist);
+  lic.flashHint(allValid ? "三类证照均有效，已恢复正常" : "证照已保存，仍有缺失或到期项，请继续补录 / 续办");
 }
 
 function remove(id: string) {
@@ -238,18 +272,54 @@ function remove(id: string) {
           </div>
 
           <div class="record-grid">
+            <div v-if="saveHint" class="save-hint">{{ saveHint }}</div>
             <div v-if="filteredRecords.length === 0" class="empty">暂无匹配数据</div>
             <article v-for="record in filteredRecords" :key="record.id" class="record">
               <div class="record-head">
                 <p class="record-title">{{ primaryText(record) }}</p>
-                <span class="status">{{ record.status }}</span>
+                <span class="head-tags">
+                  <span
+                    class="license-badge"
+                    :class="`license-badge--${lic.summary(record).state}`"
+                  >{{ lic.badgeText(record) }}</span>
+                  <span class="status">{{ record.status }}</span>
+                </span>
               </div>
               <div class="details">
                 <span v-for="field in fields" :key="field.key">{{ field.label }}: {{ record[field.key] }}</span>
               </div>
+              <ul class="license-list">
+                <li v-for="view in lic.summary(record).views" :key="view.key">
+                  <span class="license-name">{{ lic.licenseLabels[view.key] }}</span>
+                  <span class="license-dot" :class="`license-dot--${view.state}`" />
+                  <span class="license-state" :class="`license-state--${view.state}`">{{ lic.itemHint(view) }}</span>
+                </li>
+              </ul>
+              <div v-if="lic.isEditing(record)" class="license-editor">
+                <label v-for="key in lic.licenseKeys" :key="key">
+                  {{ lic.licenseLabels[key] }}到期日
+                  <input v-model="lic.draft[key]" type="date" />
+                </label>
+                <div class="editor-actions">
+                  <button type="button" @click="saveLicenses(record)">保存证照</button>
+                  <button class="secondary" type="button" @click="lic.cancelEdit()">取消</button>
+                </div>
+                <p class="editor-tip">可逐类补录 / 续办，留空项沿用原值；到期前 30 天内会提醒续办。</p>
+              </div>
               <p class="note">{{ record.notes }}</p>
               <div class="actions">
-                <button type="button" @click="flow(record)">流转状态</button>
+                <button
+                  type="button"
+                  :disabled="!lic.canFlow(record)"
+                  :title="lic.flowBlockReason(record)"
+                  @click="flow(record)"
+                >流转状态</button>
+                <button
+                  v-if="!lic.isEditing(record)"
+                  class="secondary"
+                  type="button"
+                  @click="lic.startEdit(record)"
+                >{{ lic.editButtonText(record) }}</button>
                 <button class="secondary" type="button" @click="navigator.clipboard?.writeText(primaryText(record))">复制摘要</button>
                 <button class="danger" type="button" @click="remove(record.id)">删除</button>
               </div>
